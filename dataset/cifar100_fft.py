@@ -1,0 +1,420 @@
+from __future__ import print_function
+
+import os
+import socket
+import argparse
+import time
+from math import sqrt
+import numpy as np
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from PIL import Image
+from .auto_augmentation import CIFAR10Policy, Cutout
+from .transformAugment import RandAugment_before, RandAugment_after, ResizeImage, GaussianBlur
+import torch
+from torchvision.utils import save_image
+
+"""
+mean = {
+    'cifar100': (0.5071, 0.4867, 0.4408),
+}
+
+std = {
+    'cifar100': (0.2675, 0.2565, 0.2761),
+}
+"""
+
+
+def get_data_folder():
+    """
+    return server-dependent path to store the data
+    """
+
+    data_folder = 'data/cifar100/'
+    if not os.path.exists(data_folder):
+        data_folder = 'data/cifar100/'
+
+    return data_folder
+
+def colorful_spectrum_mix(img1, img2, alpha, ratio=1.0):
+    """Input image size: ndarray of [H, W, C]"""
+    lam = np.random.uniform(0, alpha)
+
+    assert img1.shape == img2.shape
+    h, w, c = img1.shape
+    h_crop = int(h * sqrt(ratio))
+    w_crop = int(w * sqrt(ratio))
+    h_start = h // 2 - h_crop // 2
+    w_start = w // 2 - w_crop // 2
+
+    img1_fft = np.fft.fft2(img1, axes=(0, 1))
+    img2_fft = np.fft.fft2(img2, axes=(0, 1))
+    img1_abs, img1_pha = np.abs(img1_fft), np.angle(img1_fft)
+    img2_abs, img2_pha = np.abs(img2_fft), np.angle(img2_fft)
+
+    img1_abs = np.fft.fftshift(img1_abs, axes=(0, 1))
+    img2_abs = np.fft.fftshift(img2_abs, axes=(0, 1))
+
+    img1_abs_ = np.copy(img1_abs)
+    img2_abs_ = np.copy(img2_abs)
+    img1_abs[h_start:h_start + h_crop, w_start:w_start + w_crop] = \
+        lam * img2_abs_[h_start:h_start + h_crop, w_start:w_start + w_crop] + (1 - lam) * img1_abs_[
+                                                                                          h_start:h_start + h_crop,
+                                                                                          w_start:w_start + w_crop]
+    img2_abs[h_start:h_start + h_crop, w_start:w_start + w_crop] = \
+        lam * img1_abs_[h_start:h_start + h_crop, w_start:w_start + w_crop] + (1 - lam) * img2_abs_[
+                                                                                          h_start:h_start + h_crop,
+                                                                                          w_start:w_start + w_crop]
+
+    img1_abs = np.fft.ifftshift(img1_abs, axes=(0, 1))
+    img2_abs = np.fft.ifftshift(img2_abs, axes=(0, 1))
+
+    img21 = img1_abs * (np.e ** (1j * img1_pha))
+    img12 = img2_abs * (np.e ** (1j * img2_pha))
+    img21 = np.real(np.fft.ifft2(img21, axes=(0, 1)))
+    img12 = np.real(np.fft.ifft2(img12, axes=(0, 1)))
+    img21 = np.uint8(np.clip(img21, 0, 255))
+    img12 = np.uint8(np.clip(img12, 0, 255))
+
+    return img21, img12
+
+def get_post_transform(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761]):
+    img_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    return img_transform
+
+class CIFAR100InstanceSample(datasets.CIFAR100):
+    """
+    CIFAR100Instance+Sample Dataset
+    """
+
+    def __init__(self, root, train=True,
+                 transform=None, target_transform=None,
+                 download=False, k=4096, mode='exact',
+                 is_sample=True, percent=1.0, 
+                 pos_k=-1,
+                 few_ratio=1.0
+	):
+        super().__init__(root=root, train=train, download=download,
+                         transform=transform, target_transform=target_transform)
+        self.k = k
+        self.mode = mode
+        self.is_sample = is_sample
+        if few_ratio <1.0:
+            from sklearn.model_selection import StratifiedShuffleSplit
+            ss = StratifiedShuffleSplit(n_splits=1, test_size=1-few_ratio, random_state=0)
+            train_indices, valid_indices = list(ss.split(np.array(self.targets)[:, np.newaxis],self.targets))[0]
+            self.data = self.data[train_indices]
+            self.targets = [self.targets[i] for i in train_indices]
+
+        num_classes = 100
+        if self.train:
+            num_samples = len(self.data)
+            label = self.targets
+        else:
+            num_samples = len(self.data)
+            label = self.targets
+
+        self.cls_positive = [[] for i in range(num_classes)]
+        for i in range(num_samples):
+            self.cls_positive[label[i]].append(i)
+        self.cls_negative = [[] for i in range(num_classes)]
+        for i in range(num_classes):
+            for j in range(num_classes):
+                if j == i:
+                    continue
+                self.cls_negative[i].extend(self.cls_positive[j])
+
+        self.cls_positive = [np.asarray(self.cls_positive[i])
+                             for i in range(num_classes)]
+        self.cls_negative = [np.asarray(self.cls_negative[i])
+                             for i in range(num_classes)]
+
+        if 0 < percent < 1:
+            n = int(len(self.cls_negative[0]) * percent)
+            self.cls_negative = [np.random.permutation(self.cls_negative[i])[0:n]
+                                 for i in range(num_classes)]
+
+        self.cls_positive = np.asarray(self.cls_positive)
+        self.cls_negative = np.asarray(self.cls_negative)
+        self.pos_k = pos_k
+
+    def __getitem__(self, index):
+        if self.train:
+            img, target = self.data[index], self.targets[index]
+        else:
+            img, target = self.data[index], self.targets[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        if not self.is_sample:
+            # directly return
+            return img, target, index
+        else:
+            # sample contrastive examples
+            if self.mode == 'exact':
+                pos_idx = index
+            elif self.mode == 'relax':
+                pos_idx = np.random.choice(self.cls_positive[target], 1)
+                pos_idx = pos_idx[0]
+            else:
+                raise NotImplementedError(self.mode)
+            replace = True if self.k > len(
+                self.cls_negative[target]) else False
+            neg_idx = np.random.choice(
+                self.cls_negative[target], self.k, replace=replace)
+            sample_idx = np.hstack((np.asarray([pos_idx]), neg_idx))
+            if self.pos_k > 0:
+                replace = True if self.pos_k > len(
+                    self.cls_positive[target]) else False
+                pos_idx = np.random.choice(
+                    self.cls_positive[target], self.pos_k, replace=replace)
+                return img, target, index, [sample_idx, pos_idx]
+            else:
+                return img, target, index, sample_idx
+
+class CIFAR100InstanceSampleHMCKD(CIFAR100InstanceSample):
+    """
+    CIFAR100Instance+Sample+mixpos Dataset
+    return one sample and mixup_num mixpos samples
+    """
+
+    def __init__(self, root, train=True,
+                 transform=None, target_transform=None,
+                 download=False, k=4096, mode='exact',
+                 is_sample=True, percent=1.0, 
+                 pos_k=-1,
+                 mixup_num=1,
+                 opt=None):
+        super().__init__(root=root, train=train, download=download,
+                         transform=transform, target_transform=target_transform, k=k, mode=mode,
+                         is_sample=True, percent=percent,
+                         pos_k=pos_k,few_ratio=opt.few_ratio)
+        self.opt = opt
+        self.post_transform = get_post_transform()
+
+    def __getitem__(self, index):
+        if self.train:
+            img, target = self.data[index], self.targets[index]
+        else:
+            img, target = self.data[index], self.targets[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        # -1 mixup img
+        # 0 normal img
+        # n normal img + n mixup img
+
+        if self.opt.mixup_num == -1:
+            mixup_indexes = np.array([index])
+            img = Image.fromarray(img)
+            img = self.transform(img)
+            m_idx = np.random.choice(self.cls_positive[target], 1)[0]
+            img_midx = self.data[m_idx]
+            if self.opt.mixup_rotate>0:
+                img_midx = np.rot90(img_midx, np.random.randint(4)).copy()
+            img_midx = Image.fromarray(img_midx)
+            img_midx = self.transform(img_midx)
+            lam = np.random.rand()
+            img_midx = lam * img + (1-lam) * img_midx
+            imgs = [img_midx]
+
+        else:
+
+            # ---------------------------------------------------------------
+            # Sim Pos
+            start = time.time()
+            cos_similarities = []
+            img_vector = img.reshape(-1)
+            for pos_sample in self.data[self.cls_positive[target]]:
+                pos_sample_vector = pos_sample.reshape(-1)
+                cos_similarities.append(np.dot(img_vector, pos_sample_vector) / (
+                            np.linalg.norm(img_vector) * np.linalg.norm(pos_sample_vector)))
+            sorted_indexes = np.argsort(cos_similarities)[:3]
+            mixup_indexes = [self.cls_positive[target][i] for i in sorted_indexes]
+            end = time.time() - start
+
+            # ---------------------------------------------------------------
+            # FFT
+            img1 = Image.fromarray(img)
+            imgs = [self.transform(img1)]
+
+            for i, m_idx in enumerate(mixup_indexes):
+                img_midx, target_midx = self.data[m_idx], self.targets[m_idx]
+                if self.opt.mixup_rotate>0:
+                    img_midx = np.rot90(img_midx, np.random.randint(4)).copy()
+                img_ori, img_midx = colorful_spectrum_mix(img, img_midx, alpha=1)
+                img_midx = self.transform(Image.fromarray(img_midx))
+                imgs.append(img_midx)
+
+            mixup_indexes = np.append(np.array([index]), mixup_indexes)
+
+        img = np.stack(imgs)
+        if not self.is_sample:
+            # directly return
+            return img, target, index
+        else:
+            # sample contrastive examples
+            if self.mode == 'exact':
+                pos_idx = index
+            elif self.mode == 'relax':
+                pos_idx = np.random.choice(self.cls_positive[target], 1)
+                pos_idx = pos_idx[0]
+            else:
+                raise NotImplementedError(self.mode)
+            replace = True if self.k > len(
+                self.cls_negative[target]) else False
+
+            # ---------------------------------------------------------------
+            # Hard Neg
+            start3 = time.time()
+            negative_cos_similarities = []
+            img_vector = img[0].reshape(-1).copy()
+            for negpos_sample in self.data[self.cls_negative[target]]:
+                negative_pos_sample_vector = negpos_sample.reshape(-1)
+                negative_cos_similarities.append(np.dot(img_vector, negative_pos_sample_vector) / (
+                        np.linalg.norm(img_vector) * np.linalg.norm(negative_pos_sample_vector)))
+            negative_sorted_indexes = np.argsort(negative_cos_similarities)[-self.k:]
+            neg_idx = [self.cls_negative[target][i] for i in negative_sorted_indexes]
+            end3 = time.time() - start3
+
+            sample_idx = np.hstack((np.asarray([pos_idx]), neg_idx))
+            if self.pos_k > 0:
+                replace = True if self.pos_k + 1 > len(
+                    self.cls_positive[target]) else False
+                cls_positive = self.cls_positive[target]
+                cls_positive = np.delete(
+                    cls_positive, np.where(cls_positive == index))
+                pos_idxes = np.random.choice(
+                    cls_positive, self.pos_k, replace=replace)
+                if index in pos_idxes:
+                    import pdb
+                    pdb.set_trace()
+                return img, target, index, [sample_idx, pos_idxes], mixup_indexes
+            else:
+                return img, target, index, sample_idx, mixup_indexes
+
+
+def get_cifar100_dataloaders_sample(batch_size=128, num_workers=0, k=4096,
+                                    mode='exact',
+                                    is_sample=True, percent=1.0,
+                                    autoaugment=False, cutout=False, weak_transform=False, strong_transform=False,
+                                    pos_k=-1,
+                                    loader_type=None,
+                                    opt=None
+                                    ):
+    """
+    cifar 100
+    """
+
+    weak = [
+        ResizeImage(32),
+        transforms.RandomResizedCrop(32, scale=(0.2, 1.)),  # 先随机裁剪为不同的大小和宽高比，然后缩放裁剪得到的图像为指定的大小
+        transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomApply([GaussianBlur([.1, .2])], p=0.5),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ]
+
+    strong = [
+        RandAugment_before(3, 6),
+        transforms.RandomResizedCrop(size=32, scale=(0.2, 0.5)),
+        # 第一个参数输出图像大小，第二个参数裁剪面积上下限
+        # RandAugment_after(3, 6),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ]
+
+    data_folder = get_data_folder()
+    aug = [
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+    ]
+
+    if autoaugment:
+        aug.append(CIFAR10Policy())
+    aug.append(transforms.ToTensor())
+    if cutout:
+        aug.append(Cutout(n_holes=1, length=16))
+    aug.append(
+        transforms.Normalize(
+            (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    )
+
+    train_transform = transforms.Compose(aug)
+    if weak_transform:
+        train_transform = transforms.Compose(weak)
+    if strong_transform:
+        train_transform = transforms.Compose(strong)
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408),
+                             (0.2675, 0.2565, 0.2761)),
+    ])
+    if loader_type == "HMCKD":
+        train_set = CIFAR100InstanceSampleHMCKD(root=data_folder,
+                                               download=True,
+                                               train=True,
+                                               transform=train_transform,
+                                               k=k,
+                                               mode=mode,
+                                               is_sample=is_sample,
+                                               percent=percent,
+                                               pos_k=pos_k,
+                                               opt=opt)
+    elif loader_type == "normal":
+        train_set = CIFAR100InstanceSample(root=data_folder,
+                                           download=True,
+                                           train=True,
+                                           transform=train_transform,
+                                           k=k,
+                                           mode=mode,
+                                           is_sample=is_sample,
+                                           percent=percent,
+                                           pos_k=pos_k)
+    else:
+        raise NotImplementedError
+
+    n_data = len(train_set)
+    train_loader = DataLoader(train_set,
+                              batch_size=batch_size,
+                              shuffle=True,
+                              pin_memory=True,
+                              num_workers=num_workers)
+
+    test_set = datasets.CIFAR100(root=data_folder,
+                                 download=True,
+                                 train=False,
+                                 transform=test_transform)
+    test_loader = DataLoader(test_set,
+                             batch_size=int(batch_size/2),
+                             shuffle=False,
+                             pin_memory=True,
+                             num_workers=int(num_workers/2))
+
+    return train_loader, test_loader, n_data
+
+def save_image_from_tensor_batch(batch, column, path, mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761], device='cpu'):
+    batch = denorm(batch, device, mean, std)
+    save_image(batch, path, nrow=column)
+
+def denorm(tensor, device, mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761]):
+    std = torch.Tensor(std).reshape(-1, 1, 1).to(device)
+    mean = torch.Tensor(mean).reshape(-1, 1, 1).to(device)
+    res = torch.clamp(tensor * std + mean, 0, 1)
+    return res
